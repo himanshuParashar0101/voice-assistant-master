@@ -29,13 +29,23 @@ OPENAI_MODEL = "gpt-4o"
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    print("WebSocket connection accepted.")
     try:
         while True:  # Keep the connection open
+            print("Waiting to receive audio data...")
             data = await websocket.receive_bytes()  # Receive audio data
+            print("Received audio data.")
+
             audio_data = io.BytesIO(data)
 
             # Convert audio data to WAV format with 16-bit, 16kHz, mono
-            audio_segment = AudioSegment.from_file(audio_data, format="webm")
+            try:
+                audio_segment = AudioSegment.from_file(audio_data, format="webm")
+                print("Audio converted to WAV format.")
+            except Exception as e:
+                print(f"Error converting audio: {e}")
+                continue
+
             audio_segment = audio_segment.set_frame_rate(16000).set_sample_width(2).set_channels(1)
             wav_io = io.BytesIO()
             audio_segment.export(wav_io, format="wav")
@@ -44,6 +54,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # Save the WAV file locally for transcription
             with open("temp_audio.wav", "wb") as f:
                 f.write(wav_io.read())
+            print("Saved audio to temp_audio.wav.")
 
             # Transcribe audio data locally
             transcription = transcribe_audio_local("temp_audio.wav")
@@ -65,12 +76,14 @@ def transcribe_audio_local(audio_file: str) -> str:
     with sr.AudioFile(audio_file) as source:
         audio = recognizer.record(source)  # Read the entire audio file
     try:
-        # Use Google Web Speech API for transcription (you can switch to PocketSphinx if needed)
+        # Use Google Web Speech API for transcription
         transcript = recognizer.recognize_google(audio)
         return transcript
     except sr.UnknownValueError:
+        print("Could not understand audio.")
         return "Could not understand audio"
     except sr.RequestError as e:
+        print(f"Could not request results; {e}")
         return f"Could not request results; {e}"
 
 async def generate_response_and_audio(transcribed_text, websocket):
@@ -79,14 +92,13 @@ async def generate_response_and_audio(transcribed_text, websocket):
         return
 
     system_prompt = "You are a helpful AI assistant that answers questions about Earth and Mars."
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": transcribed_text}
     ]
 
     try:
-        # Use the OpenAI API to generate a response
+        print("Generating response from OpenAI...")
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -109,7 +121,7 @@ async def generate_response_and_audio(transcribed_text, websocket):
 
 async def generate_speech(text, websocket):
     try:
-        # Use OpenAI's TTS API to generate speech
+        print("Generating speech from text...")
         response = client.audio.speech.create(
             model="tts-1",
             voice="alloy",  # Change the voice model as needed
@@ -125,6 +137,7 @@ async def generate_speech(text, websocket):
 
         # Send the generated audio as bytes to the websocket client
         await websocket.send_bytes(audio_io.getvalue())
+        print("Sent generated audio to the client.")
     except Exception as e:
         print(f"Error generating speech: {e}")
         await websocket.send_text(json.dumps({'type': 'text', 'content': "Error generating speech."}))
