@@ -4,11 +4,10 @@ import json
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
+import speech_recognition as sr
 from openai import OpenAI
-from google.cloud.speech_v2 import SpeechClient
-from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
-import requests
-from dotenv import load_dotenv  # Import dotenv
+from dotenv import load_dotenv
+
 load_dotenv()
 app = FastAPI()
 
@@ -24,21 +23,6 @@ app.add_middleware(
 # Instantiate OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-# Check if the API key is set and print it
-api_key = os.getenv('OPENAI_API_KEY')
-if api_key:
-    print(f"OpenAI API Key is set: {api_key}")
-else:
-    print("OpenAI API Key is not set.")
-
-
-# Set Google Cloud project ID
-GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-if GOOGLE_CLOUD_PROJECT:
-    print(f"Google Cloud Project ID is set: {GOOGLE_CLOUD_PROJECT}")
-else:
-    print("Google Cloud Project ID is not set.")
-
 # Set OpenAI model to use (GPT-4)
 OPENAI_MODEL = "gpt-4o"
 
@@ -46,86 +30,48 @@ OPENAI_MODEL = "gpt-4o"
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
-        # Receive the audio file from the client
-        data = await websocket.receive_bytes()
-        audio_data = io.BytesIO(data)
+        while True:  # Keep the connection open
+            data = await websocket.receive_bytes()  # Receive audio data
+            audio_data = io.BytesIO(data)
 
-        # Convert audio data to WAV format with 16-bit, 16kHz, mono
-        audio_segment = AudioSegment.from_file(audio_data, format="webm")
-        audio_segment = audio_segment.set_frame_rate(16000).set_sample_width(2).set_channels(1)
-        wav_io = io.BytesIO()
-        audio_segment.export(wav_io, format="wav")
-        wav_io.seek(0)
+            # Convert audio data to WAV format with 16-bit, 16kHz, mono
+            audio_segment = AudioSegment.from_file(audio_data, format="webm")
+            audio_segment = audio_segment.set_frame_rate(16000).set_sample_width(2).set_channels(1)
+            wav_io = io.BytesIO()
+            audio_segment.export(wav_io, format="wav")
+            wav_io.seek(0)
 
-        # Save the WAV file locally for Google Cloud transcription
-        with open("temp_audio.wav", "wb") as f:
-            f.write(wav_io.read())
+            # Save the WAV file locally for transcription
+            with open("temp_audio.wav", "wb") as f:
+                f.write(wav_io.read())
 
-        # Transcribe audio data using Google Cloud
-        transcription = transcribe_google_cloud("temp_audio.wav")
-        print(f"Transcribed text: {transcription}")
+            # Transcribe audio data locally
+            transcription = transcribe_audio_local("temp_audio.wav")
+            print(f"Transcribed text: {transcription}")
 
-        # Send the transcription to the client (optional)
-        await websocket.send_text(json.dumps({'type': 'text', 'content': transcription}))
+            # Send the transcription to the client (optional)
+            await websocket.send_text(json.dumps({'type': 'text', 'content': transcription}))
 
-        # Stream GPT-4 response and TTS audio back to the client
-        await generate_response_and_audio(transcription, websocket)
+            # Stream GPT-4 response and TTS audio back to the client
+            await generate_response_and_audio(transcription, websocket)
 
     except Exception as e:
         print(f"Error in WebSocket connection: {e}")
         await websocket.close()
 
-def transcribe_google_cloud(stream_file: str) -> str:
-    """Transcribes audio from an audio file stream using Google Cloud Speech-to-Text API."""
-    client = SpeechClient()
-
-    # Read the audio file as bytes
-    with open(stream_file, "rb") as f:
-        audio_content = f.read()
-
-    # Split the audio into smaller chunks (max 25,600 bytes per chunk)
-    max_chunk_size = 25600  # Google Cloud limit
-    stream = [
-        audio_content[start: start + max_chunk_size]
-        for start in range(0, len(audio_content), max_chunk_size)
-    ]
-
-    audio_requests = (
-        cloud_speech_types.StreamingRecognizeRequest(audio=audio) for audio in stream
-    )
-
-    recognition_config = cloud_speech_types.RecognitionConfig(
-        auto_decoding_config=cloud_speech_types.AutoDetectDecodingConfig(),
-        language_codes=["en-US"],
-        model="long",
-    )
-    
-    streaming_config = cloud_speech_types.StreamingRecognitionConfig(
-        config=recognition_config
-    )
-
-    config_request = cloud_speech_types.StreamingRecognizeRequest(
-        recognizer=f"projects/{GOOGLE_CLOUD_PROJECT}/locations/global/recognizers/_",
-        streaming_config=streaming_config,
-    )
-
-    def requests(config: cloud_speech_types.RecognitionConfig, audio: list):
-        yield config
-        yield from audio
-
-    # Transcribes the audio into text
-    responses_iterator = client.streaming_recognize(
-        requests=requests(config_request, audio_requests)
-    )
-
-    responses = []
-    transcript = ""
-    for response in responses_iterator:
-        responses.append(response)
-        for result in response.results:
-            transcript += result.alternatives[0].transcript + " "
-
-    return transcript.strip()
+def transcribe_audio_local(audio_file: str) -> str:
+    """Transcribes audio from a local audio file using SpeechRecognition."""
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_file) as source:
+        audio = recognizer.record(source)  # Read the entire audio file
+    try:
+        # Use Google Web Speech API for transcription (you can switch to PocketSphinx if needed)
+        transcript = recognizer.recognize_google(audio)
+        return transcript
+    except sr.UnknownValueError:
+        return "Could not understand audio"
+    except sr.RequestError as e:
+        return f"Could not request results; {e}"
 
 async def generate_response_and_audio(transcribed_text, websocket):
     if not transcribed_text:
@@ -140,7 +86,7 @@ async def generate_response_and_audio(transcribed_text, websocket):
     ]
 
     try:
-        # Use the new OpenAI API to generate a response
+        # Use the OpenAI API to generate a response
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -163,17 +109,15 @@ async def generate_response_and_audio(transcribed_text, websocket):
 
 async def generate_speech(text, websocket):
     try:
-        # Use OpenAI's new TTS API to generate speech
+        # Use OpenAI's TTS API to generate speech
         response = client.audio.speech.create(
             model="tts-1",
-            voice="alloy",  # You can change the voice model as needed
+            voice="alloy",  # Change the voice model as needed
             input=text,
         )
 
         # Create a BytesIO object to store the binary audio response
         audio_io = io.BytesIO()
-
-        # Write the binary audio content directly to BytesIO
         audio_io.write(response.content)
 
         # Reset the buffer's position to the beginning
