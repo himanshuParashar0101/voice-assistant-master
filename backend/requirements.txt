@@ -1,0 +1,9 @@
+
+fastapi
+uvicorn[standard]
+openai
+pydub
+gTTS
+aiofiles
+python-multipart
+requests
